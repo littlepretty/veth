@@ -105,6 +105,7 @@ static void xmit_server(void)
   int len;
   struct veth_priv *priv;
   u_int32_t pkt_len;
+  u_int32_t pkt_len_temp;
 
   PDEBUG("\n#### Kernel thread initialize #####\n");
   lock_kernel();
@@ -126,12 +127,6 @@ static void xmit_server(void)
     return;
   }
 
-  /*
-  kthread->fd = sock_map_fd(kthread->sock);
-  if (kthread->fd < 0) {
-    goto release;
-  }
-  */
   memset(&kthread->addr, 0, sizeof(kthread->addr));
   kthread->addr.sin_family      = AF_INET;
   kthread->addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -190,8 +185,8 @@ static void xmit_server(void)
 	PDEBUG("ERROR:RECV PKT SIZE(%d)\n", len);
 	continue;
       }
-
-      pkt_len = ntohl(msgbuf);
+      memcpy(&pkt_len_temp, msgbuf, 4);
+      pkt_len = veth_ntohl(pkt_len_temp);
       if (pkt_len > MAX_PAYLOAD) {  // frame size is short than MAX_LEN
 	PDEBUG("ERROR:RECV PAYLOAD SIZE(%d)\n", pkt_len);
 	continue;
@@ -295,31 +290,29 @@ int veth_release(struct net_device *dev)
 static void veth_hw_tx(char *buf, int len, struct net_device *dev)
 {
   struct veth_priv *priv; 
-  u_int32_t pkt_len;
+  u_int32_t pkt_len, pkt_len_temp;
+
   priv = netdev_priv(dev);
   if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
     printk("veth: packet too short .. (%i octets\n",len);
     return;
   }
 
-  /* debug data */
-  PDEBUG("called veth_hw_tx\n");
- 
-  /* check client socket is connected */
-  if (kthread->running == -1) {
-    // client is not exist
-    PDEBUG("NO Link up:(%d):(%s)\n",len, buf);
-    priv->stats.rx_dropped++;
+  pkt_len_temp = (u_int32_t)len;
+  /* send payload using client socket with non-blocking */
+  pkt_len = veth_htonl(pkt_len_temp);
+  PDEBUG("DATA SIZE:(%d)(%d)\n",sizeof(u_int32_t),veth_ntohl(pkt_len));
+  if (client) {
+    PDEBUG("Client not exist\n");
+    priv->stats.tx_dropped++;
     return;
   }
-  else {
-    /* send payload using client socket with non-blocking */
-    pkt_len = htonl(len);
-    if(ksocket_send(client, &cliaddr, &pkt_len, 4) != -1) {
-      ksocket_send(client, &cliaddr, buf, len);
-      dev_kfree_skb(priv->skb);
-    }
+
+  if(ksocket_send(client, &cliaddr, &pkt_len, 4) != -1) {
+    ksocket_send(client, &cliaddr, buf, len);
+    dev_kfree_skb(priv->skb);
   }
+
 
 }
 
@@ -457,7 +450,7 @@ static void veth_cleanup(void)
   printk(KERN_ALERT "veth cleanup\n");
 
   sock_release(kthread->sock);
-  kthread_stop((struct task_struct*)kthread);
+  //kthread_stop((struct task_struct*)kthread);
   kfree(kthread);
 
   unregister_netdev(veth_dev);
