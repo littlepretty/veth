@@ -25,25 +25,36 @@
 
 #define MAX_PAYLOAD 1564
 #define MODULE_NAME "veth"
+#define INADDR_SEND INADDR_LOOPBACK
 
 MODULE_AUTHOR("Choonho Son");
 MODULE_LICENSE("Dual BSD/GPL");
 
 /* module parameter variable */
-static char *srcip = "127.0.0.1";
 static int srcport = 10000;
-
-module_param(srcip, charp, S_IWUSR);
+static char *dstip = "127.0.0.1";
+static int dstport = 10001;
+module_param(dstip, charp, S_IWUSR);
 module_param(srcport, int, S_IWUSR);
+module_param(dstport, int, S_IWUSR);
 
 struct net_device *veth_dev;
 static void (*veth_interrupt)(int, void *, struct pt_regs *);
 void veth_rx(struct net_device*, char*, int);
 
-static struct socket *client;
-static struct sockaddr_in cliaddr;
+//static struct socket *client;
+//static struct sockaddr_in cliaddr;
 
-/* TCP kernel socket */
+/* UDP client socket */
+struct udp_client {
+  struct socket *sock;
+  struct sockaddr_in addr;
+  int connect;
+};
+
+struct udp_client *myclient;
+
+/* UDP Server kernel socket */
 struct kthread_t {
   struct task_struct *thread;
   struct socket *sock;
@@ -51,7 +62,6 @@ struct kthread_t {
   struct sockaddr_in addr;
   //struct sockaddr_in cliaddr;
   int running;
-  int client_socket;
 };
 
 /* function prototype */
@@ -117,12 +127,12 @@ static void xmit_server(void)
   unlock_kernel();
 
   //kthread->running = -1;
-  kthread->client_socket = -1;
+  //kthread->client_socket = -1;
   priv = netdev_priv(veth_dev);
 
   /* create socket */
-  /* initial tcp kernel socket server */
-  err = sock_create_kern(AF_INET, SOCK_STREAM, IPPROTO_TCP, &kthread->sock);
+  /* initial udp kernel socket server */
+  err = sock_create_kern(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &kthread->sock);
   if (err < 0) {
     printk("sock_create() err %d\n", err);
     return;
@@ -141,76 +151,66 @@ static void xmit_server(void)
   }
   
   // listen
+  /*
   err = kthread->sock->ops->listen(kthread->sock, backlog);
   if (err < 0) {
     printk("sock_listen() err %d\n", err);
     goto release;
   }
-
+  */
 
 
   /* main loop for client connect */
-  while(1) {
-    PDEBUG("Called sock create\n");
-    // accept
-    //err = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &kthread->client);
-    err = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &client);
-    if (err < 0) {
-      printk(KERN_ALERT "client sock fail\n");
-      goto release;
+  while(!kthread_should_stop()) {
+    // receive data from remote device, and interrupt RECV
+    memset(&msgbuf, 0, bufsize);
+    // read data size (4 bytes)
+    len = ksocket_recv(kthread->sock, &kthread->addr, msgbuf, MAX_PAYLOAD);
+    if (len < 0 || len > MAX_PAYLOAD) {
+      PDEBUG("RECV MSG size(%d)\n", len);
+      continue;
     }
-	
-    client->type = kthread->sock->type;
-    client->ops = kthread->sock->ops;
+
+    if(signal_pending(current)) break;
     
-	kthread->client_socket = 0;
-    err = client->ops->accept(kthread->sock, client, 0);
-	PDEBUG("Client socket:%p\n", client); 
-    if (err < 0) {
-      printk(KERN_ALERT "accept failed(%d)\n",err);
-      goto release;
-    }
-    else {
-      PDEBUG("Accept success\n");
-      kthread->client_socket = 1;
-    }
-
-    /* main loop */
-    while(!kthread_should_stop()) {
-      // receive data from remote device, and interrupt RECV
-      memset(&msgbuf, 0, bufsize);
-
-      // read data size (4 bytes)
-      len = ksocket_recv(client, &cliaddr, msgbuf, 4);
-      //len = sock_recvmsg(client, &msg, sizeof(p_size), 0); 
-      if (len != 4) { // recv bytes is 4 (pkt length)
-		PDEBUG("ERROR:RECV PKT SIZE(%d)\n", len);
-		continue;
-      }
-      memcpy(&pkt_len_temp, msgbuf, 4);
-      pkt_len = veth_ntohl(pkt_len_temp);
-      if (pkt_len > MAX_PAYLOAD) {  // frame size is short than MAX_LEN
-		PDEBUG("ERROR:RECV PAYLOAD SIZE(%d)\n", pkt_len);
-		continue;
-      }
-
-      // pass recv real payload
-      memset(&msgbuf, 0, bufsize);
-      len = ksocket_recv(client, &cliaddr, msgbuf, pkt_len);
-      veth_rx(veth_dev, msgbuf, pkt_len);
-    }
-    PDEBUG("exit inner while\n");
-    kthread->running = -1;
-    sock_release(client);
-    client = NULL;
+    veth_rx(veth_dev, msgbuf, pkt_len);
   }
 
 
  release:
   sock_release(kthread->sock);
-  sock_release(client);
   kthread->sock = NULL;
-  client = NULL;
+}
+
+static struct udp_client* client_init(struct udp_client* client)
+{
+  struct udp_client *myclient = client;
+  int err;
+
+  //myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
+
+  /* create client socket */
+  if ( (err=sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &myclient->sock)) < 0) {
+    PDEBUG("Can not create client socket\n");
+    goto out;
+  }
+
+  memset(&myclient->addr, 0, sizeof(struct sockaddr));
+  myclient->addr.sin_family = AF_INET;
+  myclient->addr.sin_addr.s_addr = htonl(INADDR_SEND);
+  myclient->addr.sin_port = htons(dstport);
+
+  if(  (err = myclient->sock->ops->connect(myclient->sock, (struct sockaddr *)&myclient->addr, sizeof(struct sockaddr),0)) < 0) {
+    PDEBUG("Failed to connect\n");
+    goto close_out;
+  }
+ out:
+  myclient->connect = -1;
+ close_out:
+  sock_release(myclient->sock);
+  myclient->connect = -1;
+
+  return myclient;
 }
 
 int ksocket_send(struct socket *sock, struct sockaddr_in *addr, unsigned char *buf, int len)
@@ -272,8 +272,12 @@ int ksocket_recv(struct socket* sock, struct sockaddr_in* addr, unsigned char* b
 int veth_open(struct net_device *dev)
 {
   PDEBUG("veth_open\n");
-  PDEBUG("Server IP:%s(%d)\n",srcip, srcport);
+  PDEBUG("Server IP:localhost(%d)\n",srcport);
+  PDEBUG("Client IP:(%d)(%d)\n",dstip, dstport);
   
+  myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
+  memset(myclient,0,sizeof(struct udp_client));
+
   netif_start_queue(dev);
 
   return 0;
@@ -300,21 +304,22 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
     return;
   }
 
-  pkt_len_temp = (u_int32_t)len;
-  /* send payload using client socket with non-blocking */
-  pkt_len = veth_htonl(pkt_len_temp);
-  PDEBUG("DATA SIZE:(%d)(%d)\n",sizeof(u_int32_t),veth_ntohl(pkt_len));
-  if (kthread->client_socket == 0) {
-    PDEBUG("Client not exist\n");
-    priv->stats.tx_dropped++;
-    return;
+  if (myclient->connect == 0) {
+    // reconnect
+    myclient = client_init(myclient);
+    if(myclient->connect == 0) {
+      PDEBUG("Client init fail\n");
+      return;
+    }
   }
+  ksocket_send(myclient->sock, &myclient->addr, buf, len);
 
+  /*
   if(ksocket_send(client, &cliaddr, &pkt_len, 4) != -1) {
     ksocket_send(client, &cliaddr, buf, len);
     dev_kfree_skb(priv->skb);
   }
-
+  */
 
 }
 
@@ -453,7 +458,7 @@ static void veth_cleanup(void)
   printk(KERN_ALERT "veth cleanup\n");
 
   sock_release(kthread->sock);
-  sock_release(client);
+  //sock_release(client);
   //kthread_stop((struct task_struct*)kthread);
   kfree(kthread);
 
