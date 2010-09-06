@@ -51,6 +51,7 @@ struct kthread_t {
   struct sockaddr_in addr;
   //struct sockaddr_in cliaddr;
   int running;
+  int client_socket;
 };
 
 /* function prototype */
@@ -116,7 +117,7 @@ static void xmit_server(void)
   unlock_kernel();
 
   //kthread->running = -1;
-
+  kthread->client_socket = -1;
   priv = netdev_priv(veth_dev);
 
   /* create socket */
@@ -158,19 +159,20 @@ static void xmit_server(void)
       printk(KERN_ALERT "client sock fail\n");
       goto release;
     }
-    
+	
     client->type = kthread->sock->type;
     client->ops = kthread->sock->ops;
     
-    
+	kthread->client_socket = 0;
     err = client->ops->accept(kthread->sock, client, 0);
+	PDEBUG("Client socket:%p\n", client); 
     if (err < 0) {
       printk(KERN_ALERT "accept failed(%d)\n",err);
       goto release;
     }
     else {
       PDEBUG("Accept success\n");
-      kthread->running = 0;
+      kthread->client_socket = 1;
     }
 
     /* main loop */
@@ -182,14 +184,14 @@ static void xmit_server(void)
       len = ksocket_recv(client, &cliaddr, msgbuf, 4);
       //len = sock_recvmsg(client, &msg, sizeof(p_size), 0); 
       if (len != 4) { // recv bytes is 4 (pkt length)
-	PDEBUG("ERROR:RECV PKT SIZE(%d)\n", len);
-	continue;
+		PDEBUG("ERROR:RECV PKT SIZE(%d)\n", len);
+		continue;
       }
       memcpy(&pkt_len_temp, msgbuf, 4);
       pkt_len = veth_ntohl(pkt_len_temp);
       if (pkt_len > MAX_PAYLOAD) {  // frame size is short than MAX_LEN
-	PDEBUG("ERROR:RECV PAYLOAD SIZE(%d)\n", pkt_len);
-	continue;
+		PDEBUG("ERROR:RECV PAYLOAD SIZE(%d)\n", pkt_len);
+		continue;
       }
 
       // pass recv real payload
@@ -302,7 +304,7 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
   /* send payload using client socket with non-blocking */
   pkt_len = veth_htonl(pkt_len_temp);
   PDEBUG("DATA SIZE:(%d)(%d)\n",sizeof(u_int32_t),veth_ntohl(pkt_len));
-  if (client) {
+  if (kthread->client_socket == 0) {
     PDEBUG("Client not exist\n");
     priv->stats.tx_dropped++;
     return;
@@ -384,6 +386,7 @@ void veth_rx(struct net_device *dev, char* data, int datalen)
   struct sk_buff *skb;
   struct veth_priv *priv = netdev_priv(dev);
   
+  PDEBUG("VETH_RX:len(%d)\n",datalen);
   skb = dev_alloc_skb(datalen + 2);
   if (!skb) {
     if (printk_ratelimit())
@@ -401,7 +404,7 @@ void veth_rx(struct net_device *dev, char* data, int datalen)
   skb->ip_summed = CHECKSUM_UNNECESSARY;  // don't check it
   priv->stats.rx_packets++;
   priv->stats.rx_bytes += datalen;
-  //netif_rx(skb);
+  netif_rx(skb);
 
  out:
   return;
@@ -450,6 +453,7 @@ static void veth_cleanup(void)
   printk(KERN_ALERT "veth cleanup\n");
 
   sock_release(kthread->sock);
+  sock_release(client);
   //kthread_stop((struct task_struct*)kthread);
   kfree(kthread);
 
