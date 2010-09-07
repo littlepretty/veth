@@ -106,17 +106,43 @@ char* inet_ntoa(struct in_addr ina)
   return buf;
 }
 
+unsigned long in_aton(const char *str)
+/* [<][>][^][v][top][bottom][index][help] */
+{
+  unsigned long l;
+  unsigned int val;
+  int i;
+  
+  l = 0;
+  for (i = 0; i < 4; i++)
+	{
+	  l <<= 8;
+	  if (*str != '\0')
+		{
+		  val = 0;
+		  while (*str != '\0' && *str != '.')
+			{
+			  val *= 10;
+			  val += *str - '0';
+			  str++;
+			}
+		  l |= val;
+		  if (*str != '\0')
+			str++;
+		}
+	}
+  return(htonl(l));
+}
+
 /* Kernel thread */
 static void xmit_server(void) 
 {
   int bufsize = 1024;
   unsigned char msgbuf[bufsize];
   int err;
-  int backlog = 1024;
   int len;
   struct veth_priv *priv;
-  u_int32_t pkt_len;
-  u_int32_t pkt_len_temp;
+
 
   PDEBUG("\n#### Kernel thread initialize #####\n");
   lock_kernel();
@@ -173,7 +199,7 @@ static void xmit_server(void)
 
     if(signal_pending(current)) break;
     
-    veth_rx(veth_dev, msgbuf, pkt_len);
+    veth_rx(veth_dev, msgbuf, len);
   }
 
 
@@ -182,13 +208,11 @@ static void xmit_server(void)
   kthread->sock = NULL;
 }
 
-static struct udp_client* client_init(struct udp_client* client)
+static void client_init(struct udp_client *myclient)
 {
-  struct udp_client *myclient = client;
   int err;
-
-  //myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
-
+  
+  PDEBUG("Called client_init\n");
   /* create client socket */
   if ( (err=sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &myclient->sock)) < 0) {
     PDEBUG("Can not create client socket\n");
@@ -197,20 +221,27 @@ static struct udp_client* client_init(struct udp_client* client)
 
   memset(&myclient->addr, 0, sizeof(struct sockaddr));
   myclient->addr.sin_family = AF_INET;
+  //myclient->addr.sin_addr.s_addr = htonl(in_aton("127.0.0.1"));
   myclient->addr.sin_addr.s_addr = htonl(INADDR_SEND);
   myclient->addr.sin_port = htons(dstport);
+  
 
   if(  (err = myclient->sock->ops->connect(myclient->sock, (struct sockaddr *)&myclient->addr, sizeof(struct sockaddr),0)) < 0) {
     PDEBUG("Failed to connect\n");
     goto close_out;
-  }
+	}
+  myclient->connect = 1;
+  PDEBUG("Success connect\n");
+  return;
+  
  out:
-  myclient->connect = -1;
+  myclient->connect = 0;
  close_out:
   sock_release(myclient->sock);
-  myclient->connect = -1;
-
-  return myclient;
+  myclient->connect = 0;
+  
+  PDEBUG("MY client connect:(%d)\n",myclient->connect);
+  return;
 }
 
 int ksocket_send(struct socket *sock, struct sockaddr_in *addr, unsigned char *buf, int len)
@@ -220,8 +251,10 @@ int ksocket_send(struct socket *sock, struct sockaddr_in *addr, unsigned char *b
   mm_segment_t oldfs;
   int size = 0;
   
-  if (sock->sk == NULL)
+  if (sock->sk == NULL) {
+	PDEBUG("Client Sock fail\n");
     return 0;
+  }
 
   iov.iov_base = buf;
   iov.iov_len = len;
@@ -236,6 +269,7 @@ int ksocket_send(struct socket *sock, struct sockaddr_in *addr, unsigned char *b
   oldfs = get_fs();
   set_fs(KERNEL_DS);
   size = sock_sendmsg(sock, &msg, len);
+  PDEBUG("KSOCKET SEND(%d)\n",size);
   set_fs(oldfs);
 
   return size;
@@ -296,7 +330,6 @@ int veth_release(struct net_device *dev)
 static void veth_hw_tx(char *buf, int len, struct net_device *dev)
 {
   struct veth_priv *priv; 
-  u_int32_t pkt_len, pkt_len_temp;
 
   priv = netdev_priv(dev);
   if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
@@ -304,14 +337,17 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
     return;
   }
 
-  if (myclient->connect == 0) {
+
+  if (myclient->connect != 1) {
     // reconnect
-    myclient = client_init(myclient);
-    if(myclient->connect == 0) {
+    client_init(myclient);
+    if(myclient->connect != 1) {
       PDEBUG("Client init fail\n");
       return;
     }
   }
+
+  PDEBUG("Send pkt size(%d)\n", len); 
   ksocket_send(myclient->sock, &myclient->addr, buf, len);
 
   /*
@@ -338,12 +374,14 @@ static int veth_tx(struct sk_buff *skb, struct net_device *dev)
   printk(KERN_ALERT "called veth_tx(data len:%d > %d)\n",skb->len,ETH_ZLEN);
   data = skb->data;
   len = skb->len;
+  /*
   if (len < ETH_ZLEN) {
     memset(shortpkt, 0, ETH_ZLEN);
     memcpy(shortpkt, skb->data, skb->len);
     len = ETH_ZLEN;
     data = shortpkt;
-  }
+	}
+  */
   dev->trans_start = jiffies;   /* save the timestamp */
 
   /* Remember the skb, so we can free it at interrupt time */
@@ -449,6 +487,9 @@ void veth_init(struct net_device *dev)
   priv = netdev_priv(dev);
   memset(priv, 0, sizeof(struct veth_priv));
   spin_lock_init(&priv->lock);   /* enable receive interrupt */
+  
+  myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
+  client_init(myclient);
 }
 
 
