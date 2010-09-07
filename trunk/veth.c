@@ -42,8 +42,6 @@ struct net_device *veth_dev;
 static void (*veth_interrupt)(int, void *, struct pt_regs *);
 void veth_rx(struct net_device*, char*, int);
 
-//static struct socket *client;
-//static struct sockaddr_in cliaddr;
 
 /* UDP client socket */
 struct udp_client {
@@ -109,7 +107,7 @@ char* inet_ntoa(struct in_addr ina)
 unsigned long in_aton(const char *str)
 /* [<][>][^][v][top][bottom][index][help] */
 {
-  unsigned long l;
+  u_int32_t l;
   unsigned int val;
   int i;
   
@@ -131,7 +129,7 @@ unsigned long in_aton(const char *str)
 			str++;
 		}
 	}
-  return(htonl(l));
+  return(veth_htonl(l));
 }
 
 /* Kernel thread */
@@ -152,15 +150,13 @@ static void xmit_server(void)
   allow_signal(SIGKILL);
   unlock_kernel();
 
-  //kthread->running = -1;
-  //kthread->client_socket = -1;
   priv = netdev_priv(veth_dev);
 
   /* create socket */
   /* initial udp kernel socket server */
   err = sock_create_kern(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &kthread->sock);
   if (err < 0) {
-    printk("sock_create() err %d\n", err);
+    PDEBUG("sock_create() err %d\n", err);
     return;
   }
 
@@ -172,20 +168,10 @@ static void xmit_server(void)
   // bind
   err = kthread->sock->ops->bind(kthread->sock, (struct sockaddr *)&kthread->addr, sizeof(struct sockaddr_in));
   if (err < 0) {
-    printk("sock_bind() err %d\n", err);
+    PDEBUG("sock_bind() err %d\n", err);
     goto release;
   }
   
-  // listen
-  /*
-  err = kthread->sock->ops->listen(kthread->sock, backlog);
-  if (err < 0) {
-    printk("sock_listen() err %d\n", err);
-    goto release;
-  }
-  */
-
-
   /* main loop for client connect */
   while(!kthread_should_stop()) {
     // receive data from remote device, and interrupt RECV
@@ -214,15 +200,16 @@ static void client_init(struct udp_client *myclient)
   
   PDEBUG("Called client_init\n");
   /* create client socket */
+
   if ( (err=sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &myclient->sock)) < 0) {
-    PDEBUG("Can not create client socket\n");
-    goto out;
+	PDEBUG("Can not create client socket\n");
+	goto out;
   }
 
   memset(&myclient->addr, 0, sizeof(struct sockaddr));
   myclient->addr.sin_family = AF_INET;
   //myclient->addr.sin_addr.s_addr = htonl(in_aton("127.0.0.1"));
-  myclient->addr.sin_addr.s_addr = htonl(INADDR_SEND);
+  myclient->addr.sin_addr.s_addr = in_aton(dstip);
   myclient->addr.sin_port = htons(dstport);
   
 
@@ -307,7 +294,7 @@ int veth_open(struct net_device *dev)
 {
   PDEBUG("veth_open\n");
   PDEBUG("Server IP:localhost(%d)\n",srcport);
-  PDEBUG("Client IP:(%d)(%d)\n",dstip, dstport);
+  PDEBUG("Client IP:(%s)(%d)\n",dstip, dstport);
   
   myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
   memset(myclient,0,sizeof(struct udp_client));
@@ -333,10 +320,9 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
 
   priv = netdev_priv(dev);
   if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
-    printk("veth: packet too short .. (%i octets\n",len);
+    PDEBUG("veth: packet too short .. (%i octets\n",len);
     return;
   }
-
 
   if (myclient->connect != 1) {
     // reconnect
@@ -346,7 +332,7 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
       return;
     }
   }
-
+  
   PDEBUG("Send pkt size(%d)\n", len); 
   ksocket_send(myclient->sock, &myclient->addr, buf, len);
 
@@ -371,7 +357,7 @@ static int veth_tx(struct sk_buff *skb, struct net_device *dev)
     
   DECLARE_MAC_BUF(mac);
 
-  printk(KERN_ALERT "called veth_tx(data len:%d > %d)\n",skb->len,ETH_ZLEN);
+  PDEBUG("called veth_tx(data len:%d > %d)\n",skb->len,ETH_ZLEN);
   data = skb->data;
   len = skb->len;
   /*
@@ -387,12 +373,13 @@ static int veth_tx(struct sk_buff *skb, struct net_device *dev)
   /* Remember the skb, so we can free it at interrupt time */
   priv->skb = skb;
 
-#ifdef DEBUG_HDR
+
   PDEBUG("PKT type:%d\n",skb->pkt_type);
   // MAC Header
   skb_reset_mac_header(skb);
   p = skb_mac_header(skb);
   
+#ifdef DEBUG_HDR  
   if(p) {
     printk(KERN_ALERT"Dst:%s\n",print_mac(mac, p));
     printk(KERN_ALERT"Src:%s\n",print_mac(mac,&p[6])); 
@@ -413,9 +400,11 @@ static int veth_tx(struct sk_buff *skb, struct net_device *dev)
   }
   else if(p[12] == 8 && p[13] == 6)
     PDEBUG("ARP Payload\n");
+#endif
+  
   /* actual deliver of data */
   veth_hw_tx(data, len, dev);
-#endif
+
 
   return 0;
 }
@@ -433,7 +422,7 @@ void veth_rx(struct net_device *dev, char* data, int datalen)
   skb = dev_alloc_skb(datalen + 2);
   if (!skb) {
     if (printk_ratelimit())
-      printk(KERN_NOTICE "veth rx: low on mem - packet dropped\n");
+      PDEBUG("veth rx: low on mem - packet dropped\n");
     priv->stats.rx_dropped++;
     goto out;
   }
@@ -490,19 +479,23 @@ void veth_init(struct net_device *dev)
   
   myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
   client_init(myclient);
+  myclient->sock = NULL;
 }
 
 
 
 static void veth_cleanup(void)
 {
-  printk(KERN_ALERT "veth cleanup\n");
+  PDEBUG("veth cleanup\n");
 
   sock_release(kthread->sock);
+  sock_release(myclient->sock);
+  
   //sock_release(client);
   //kthread_stop((struct task_struct*)kthread);
   kfree(kthread);
-
+  kfree(myclient);
+  
   unregister_netdev(veth_dev);
   free_netdev(veth_dev);
   return;
@@ -520,8 +513,9 @@ static int __init veth_init_module(void)
     goto out;
 
   ret = -ENODEV;
-  if( (result = register_netdev(veth_dev)) )
-    printk("veth: error registering device\n"); 
+  if( (result = register_netdev(veth_dev)) ) {
+    PDEBUG("veth: error registering device\n");
+  }
   else
     ret = 0;
 
