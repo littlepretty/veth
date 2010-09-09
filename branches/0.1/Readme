@@ -1,0 +1,27 @@
+This is virtual ethernet tunnel device.
+
+Version Test
+- Linux Kernel 2.6.28 (OK, Ubuntu 9.04)
+
+Compile
+1. Precondition
+ - Linux header files for device module compile
+   (ex. apt-get install linux-headers-$(uname -r)
+ - Compiler
+   (ex. apt-get install build-essential)
+
+2. Compile
+ - (ex. make)
+
+3. Installation
+ - (insmod veth.ko)
+ - (ifconfig veth0 a.b.c.d netmask f.f.f.f up)
+
+4. Remote virtual machine connection
+ - (ex. kvm linux.img -net nic, -net socket,udp=10001:a.b.c.d:10000)
+
+
+Choonho.son
+
+2010.09.07
+(choonho.son@gmail.com)
