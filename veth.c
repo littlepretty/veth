@@ -77,12 +77,12 @@ struct veth_packet {
 int pool_size = 8;
 module_param(pool_size, int, 0);
 
-
 struct veth_priv {
   struct net_device_stats stats;
   int status;
-  //struct veth_packet *ppool;
+  struct veth_packet *pool;
   struct veth_packet *tx_queue;    /* list of incoming packets */
+  struct veth_packet *last;
   //int rx_int_enabled;
   int tx_packetlen;
   //u8 *tx_packetdata;
@@ -91,6 +91,75 @@ struct veth_priv {
   spinlock_t lock;
 };
 
+void veth_setup_tx_pool()
+{
+  struct veth_priv *priv;
+  int i;
+  struct veth_packet *pkt;
+
+  priv = netdev_priv(veth_dev);
+
+  for(i = 0; i < pool_size; i++) {
+    pkt = kmalloc(sizeof(struct veth_packet), GFP_KERNEL);
+    if (pkt == NULL) {
+      PDEBUG("Ran out of memory\n");
+      return;
+    }
+    pkt->next = priv->pool;
+    priv->pool = pkt;
+  }
+}
+
+struct veth_packet* veth_get_tx_buffer()
+{
+  unsigned long flags;
+  struct veth_packet *pkt;
+  struct veth_priv *priv = netdev_priv(veth_dev);
+
+  spin_lock_irqsave(&priv->lock, flags);
+  pkt = priv->pool;
+  priv->pool = pkt->next;
+  if (priv->pool == NULL) {
+    printk(KERN_INFO "pool empty\n");
+    netif_stop_queue(veth_dev);
+  }
+  spin_unlock_irqrestore(&priv->lock, flags);
+  return pkt;
+}
+
+void veth_enqueue_buf(struct veth_packet *pkt)
+{
+  unsigned long flags;
+  struct veth_packet *last;
+
+  struct veth_priv *priv = netdev_priv(veth_dev);
+  
+  spin_lock_irqsave(&priv->lock, flags);
+  last = priv->last;
+  last->next = pkt;
+  priv->tx_packetlen++;
+  pkt->next = NULL;
+  spin_unlock_irqrestore(&priv->lock, flags);
+}
+
+struct veth_packet* veth_dequeue_buf()
+{
+  unsigned long flags;
+  struct veth_packet *head;
+  struct veth_packet *next;
+  struct veth_priv *priv = netdev_priv(veth_dev);
+
+  spin_lock_irqsave(&priv->lock, flags);
+
+  head = priv->tx_queue;
+  next = head->next;
+  priv->tx_queue = next;
+  priv->tx_packetlen--;
+
+  spin_unlock_irqrestore(&priv->lock, flags);
+  return head;
+}
+  
 struct kthread_t *kthread = NULL;
 struct kthread_t *send_kthread = NULL;
 
@@ -139,9 +208,11 @@ static void send_client(void)
 {
   int bufsize = 1024;
   unsigned char msgbuf[bufsize];
+  unsigned long flags;
   int err;
   int len;
   struct veth_priv *priv;
+  struct veth_packet *pkt;
 
   PDEBUG("#### Kernel thread SEND client ####\n");
   lock_kernel();
@@ -171,10 +242,14 @@ static void send_client(void)
   
   /* main loop for client send */
   while(!kthread_should_stop()) {
-	PDEBUG("SEND\n");
-	ksocket_send(send_kthread->sock, &send_kthread->addr, "buf", 3);
-
-	if(signal_pending(current)) break;
+    spin_lock_irqsave(&priv->lock, flags);
+    if (priv->tx_packetlen > 0) {
+      pkt = veth_dequeue_buf();
+      ksocket_send(send_kthread->sock, &send_kthread->addr, pkt->data, pkt->datalen);
+    }
+    spin_unlock_irqrestore(&priv->lock, flags);
+    
+    if(signal_pending(current)) break;
 	
   }
   
@@ -372,13 +447,21 @@ int veth_release(struct net_device *dev)
 static void veth_hw_tx(char *buf, int len, struct net_device *dev)
 {
   struct veth_priv *priv; 
+  struct veth_packet *pkt;
 
   priv = netdev_priv(dev);
   if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
     PDEBUG("veth: packet too short .. (%i octets\n",len);
     return;
   }
-  
+
+  // get veth_packet
+  pkt = veth_get_tx_buffer();
+  memcpy(pkt->data, buf, len);
+  pkt->datalen = len;
+
+  // push into buffer
+  veth_enqueue_buf(pkt);
   /*
   if (myclient->connect != 1) {
     // reconnect
@@ -534,6 +617,7 @@ void veth_init(struct net_device *dev)
   memset(priv, 0, sizeof(struct veth_priv));
   spin_lock_init(&priv->lock);   /* enable receive interrupt */
   
+  veth_setup_tx_pool();
   //myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
   //client_init(myclient);
   //myclient->sock = NULL;
@@ -590,17 +674,19 @@ static int __init veth_init_module(void)
   send_kthread->thread = NULL;
 
   /* start kernel thread */
+  PDEBUG("thread 1\n");
   kthread->thread = kthread_run((void*)recv_server, NULL, "recv_server");
   if(IS_ERR(kthread->thread))
     goto out;
-  return 0;
 
+  PDEBUG("thread 2\n");
   send_kthread->thread = kthread_run((void*)send_client, NULL, "send_client");
   if(IS_ERR(send_kthread->thread))
     goto out;
   return 0;
 
  out:
+  PDEBUG("THREAD ERR\n");
   if (ret)
     veth_cleanup();
   return ret;
