@@ -25,6 +25,7 @@
 
 #define MAX_PAYLOAD 1564
 #define MODULE_NAME "veth"
+#define MODULE_NAME1 "veth_client"
 #define INADDR_SEND INADDR_LOOPBACK
 
 MODULE_AUTHOR("Choonho Son");
@@ -68,7 +69,7 @@ int ksocket_send(struct socket *sock, struct sockaddr_in *addr, unsigned char *b
 
 struct veth_packet {
   struct veth_packet *next;
-  struct net_device *dev;
+  //struct net_device *dev;
   int datalen;
   u8 data[ETH_DATA_LEN];
 };
@@ -80,17 +81,18 @@ module_param(pool_size, int, 0);
 struct veth_priv {
   struct net_device_stats stats;
   int status;
-  struct veth_packet *ppool;
-  struct veth_packet *rx_queue;    /* list of incoming packets */
-  int rx_int_enabled;
+  //struct veth_packet *ppool;
+  struct veth_packet *tx_queue;    /* list of incoming packets */
+  //int rx_int_enabled;
   int tx_packetlen;
-  u8 *tx_packetdata;
+  //u8 *tx_packetdata;
 
   struct sk_buff *skb;
   spinlock_t lock;
 };
 
 struct kthread_t *kthread = NULL;
+struct kthread_t *send_kthread = NULL;
 
 static char buf[4*sizeof "123"];
 char* inet_ntoa(struct in_addr ina)
@@ -132,8 +134,61 @@ unsigned long in_aton(const char *str)
   return(veth_htonl(l));
 }
 
+/* Kernel Send Thread */
+static void send_client(void)
+{
+  int bufsize = 1024;
+  unsigned char msgbuf[bufsize];
+  int err;
+  int len;
+  struct veth_priv *priv;
+
+  PDEBUG("#### Kernel thread SEND client ####\n");
+  lock_kernel();
+  send_kthread->running = 1;
+  current->flags |= PF_NOFREEZE;
+  daemonize(MODULE_NAME1);
+  allow_signal(SIGKILL);
+  unlock_kernel();
+
+  priv = netdev_priv(veth_dev);
+  if ( (err=sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &send_kthread->sock)) < 0) {
+	PDEBUG("Cannot create client socket\n");
+	goto out;
+  }
+
+  memset(&send_kthread->addr, 0, sizeof(struct sockaddr));
+  send_kthread->addr.sin_family = AF_INET;
+  send_kthread->addr.sin_addr.s_addr = in_aton(dstip);
+  send_kthread->addr.sin_port = htons(dstport);
+
+  if( (err = send_kthread->sock->ops->connect(send_kthread->sock,
+											  (struct sockaddr *)&send_kthread->addr,
+											  sizeof(struct sockaddr),0)) < 0) {
+	PDEBUG("Fail to connect\n");
+	goto close_out;
+  }
+  
+  /* main loop for client send */
+  while(!kthread_should_stop()) {
+	PDEBUG("SEND\n");
+	ksocket_send(send_kthread->sock, &send_kthread->addr, "buf", 3);
+
+	if(signal_pending(current)) break;
+	
+  }
+  
+ out:
+  return;
+ close_out:
+  sock_release(send_kthread->sock);
+
+  return;
+  
+}
+
 /* Kernel thread */
-static void xmit_server(void) 
+static void recv_server(void) 
 {
   int bufsize = 1024;
   unsigned char msgbuf[bufsize];
@@ -296,8 +351,8 @@ int veth_open(struct net_device *dev)
   PDEBUG("Server IP:localhost(%d)\n",srcport);
   PDEBUG("Client IP:(%s)(%d)\n",dstip, dstport);
   
-  myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
-  memset(myclient,0,sizeof(struct udp_client));
+  //myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
+  //memset(myclient,0,sizeof(struct udp_client));
 
   netif_start_queue(dev);
 
@@ -323,7 +378,8 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
     PDEBUG("veth: packet too short .. (%i octets\n",len);
     return;
   }
-
+  
+  /*
   if (myclient->connect != 1) {
     // reconnect
     client_init(myclient);
@@ -332,9 +388,10 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
       return;
     }
   }
+  */
   
   PDEBUG("Send pkt size(%d)\n", len); 
-  ksocket_send(myclient->sock, &myclient->addr, buf, len);
+  //ksocket_send(myclient->sock, &myclient->addr, buf, len);
 
   /*
   if(ksocket_send(client, &cliaddr, &pkt_len, 4) != -1) {
@@ -477,9 +534,9 @@ void veth_init(struct net_device *dev)
   memset(priv, 0, sizeof(struct veth_priv));
   spin_lock_init(&priv->lock);   /* enable receive interrupt */
   
-  myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
-  client_init(myclient);
-  myclient->sock = NULL;
+  //myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
+  //client_init(myclient);
+  //myclient->sock = NULL;
 }
 
 
@@ -489,12 +546,15 @@ static void veth_cleanup(void)
   PDEBUG("veth cleanup\n");
 
   sock_release(kthread->sock);
-  sock_release(myclient->sock);
+  sock_release(send_kthread->sock);
+  
+  //sock_release(myclient->sock);
   
   //sock_release(client);
   //kthread_stop((struct task_struct*)kthread);
   kfree(kthread);
-  kfree(myclient);
+  kfree(send_kthread);
+  //kfree(myclient);
   
   unregister_netdev(veth_dev);
   free_netdev(veth_dev);
@@ -520,16 +580,26 @@ static int __init veth_init_module(void)
     ret = 0;
 
   /* kthread */
+  // Server
   kthread = kmalloc(sizeof(struct kthread_t), GFP_KERNEL);
   memset(kthread, 0, sizeof(struct kthread_t));
   kthread->thread = NULL;
+  // Client
+  send_kthread = kmalloc(sizeof(struct kthread_t), GFP_KERNEL);
+  memset(send_kthread, 0, sizeof(struct kthread_t));
+  send_kthread->thread = NULL;
 
   /* start kernel thread */
-  kthread->thread = kthread_run((void*)xmit_server, NULL, "xmit_server");
+  kthread->thread = kthread_run((void*)recv_server, NULL, "recv_server");
   if(IS_ERR(kthread->thread))
     goto out;
   return 0;
-  
+
+  send_kthread->thread = kthread_run((void*)send_client, NULL, "send_client");
+  if(IS_ERR(send_kthread->thread))
+    goto out;
+  return 0;
+
  out:
   if (ret)
     veth_cleanup();

@@ -1,10 +1,10 @@
 # comment/uncomment the following line to disable/enable debugging
 
-DEBUG = n
+DEBUG = y
 
 ifeq ($(DEBUG),y)
-	#DEBFLAGS = -O -g -DVETH_DEBUG -DDEBUG_HDR    # "-O" is needed to expand inlines
-	DEBFLAGS = -O -g
+	DEBFLAGS = -O -g -DVETH_DEBUG -DDEBUG_HDR    # "-O" is needed to expand inlines
+	#DEBFLAGS = -O -g
 else
 	DEBFLAGS = -O2
 endif
