@@ -167,8 +167,6 @@ struct veth_packet* veth_dequeue_buf()
   PDEBUG("veth_dequeue_buf\n");
 
   head = priv->tx_queue;
-  if (head == NULL)
-    PDEBUG("Head is NULL\n");
   priv->tx_queue = head->next;
   priv->tx_packetlen--;
 
@@ -272,11 +270,14 @@ static void send_client(void)
       pkt->next = priv->pool;
       priv->pool = pkt;
       if (priv->tx_packetlen == 0) priv->last = NULL;
-    }
-    spin_unlock_irqrestore(&priv->lock, flags);
-    
-    set_current_state(TASK_INTERRUPTIBLE);
-    schedule_timeout(100);
+	  spin_unlock_irqrestore(&priv->lock, flags);
+	}
+	else {
+	  spin_unlock_irqrestore(&priv->lock, flags);
+	  set_current_state(TASK_INTERRUPTIBLE);
+	  schedule_timeout(1);
+	}
+	
     //set_current_state(TASK_RUNNING);
     if(signal_pending(current)) break;
 
