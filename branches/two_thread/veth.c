@@ -45,15 +45,6 @@ static void (*veth_interrupt)(int, void *, struct pt_regs *);
 void veth_rx(struct net_device*, char*, int);
 
 
-/* UDP client socket */
-struct udp_client {
-  struct socket *sock;
-  struct sockaddr_in addr;
-  int connect;
-};
-
-struct udp_client *myclient;
-
 /* UDP Server kernel socket */
 struct kthread_t {
   struct task_struct *thread;
@@ -62,15 +53,12 @@ struct kthread_t {
   int running;
 };
 
-signed long delay = 100;
-
 /* function prototype */
 int ksocket_recv(struct socket *sock, struct sockaddr_in *addr, unsigned char *buf, int len);
 int ksocket_send(struct socket *sock, struct sockaddr_in *addr, unsigned char *buf, int len);
 
 struct veth_packet {
   struct veth_packet *next;
-  //struct net_device *dev;
   int datalen;
   u8 data[ETH_DATA_LEN];
 };
@@ -92,15 +80,16 @@ struct veth_priv {
   spinlock_t lock;
 };
 
-void veth_setup_tx_pool()
+void veth_setup_tx_pool(void)
 {
   struct veth_priv *priv;
   struct veth_packet *pkt;
   int i;
-
+  unsigned long flags;
   PDEBUG("veth_setup_tx_pool\n");
 
   priv = netdev_priv(veth_dev);
+  spin_lock_irqsave(&priv->lock, flags);
   for(i = 0; i < pool_size; i++) {
     pkt = kmalloc(sizeof(struct veth_packet), GFP_KERNEL);
     if (pkt == NULL) {
@@ -110,9 +99,10 @@ void veth_setup_tx_pool()
     pkt->next = priv->pool;
     priv->pool = pkt;
   }
+  spin_unlock_irqrestore(&priv->lock, flags);
 }
 
-struct veth_packet* veth_get_tx_buffer()
+struct veth_packet* veth_get_tx_buffer(void)
 {
   unsigned long flags;
   struct veth_packet *pkt;
@@ -156,24 +146,6 @@ void veth_enqueue_buf(struct veth_packet *pkt)
   spin_unlock_irqrestore(&priv->lock, flags);
 }
 
-struct veth_packet* veth_dequeue_buf()
-{
-  unsigned long flags;
-  struct veth_packet *head;
-  struct veth_packet *next;
-  struct veth_priv *priv = netdev_priv(veth_dev);
-
-  //spin_lock_irqsave(&priv->lock, flags);
-  PDEBUG("veth_dequeue_buf\n");
-
-  head = priv->tx_queue;
-  priv->tx_queue = head->next;
-  priv->tx_packetlen--;
-
-  //spin_unlock_irqrestore(&priv->lock, flags);
-  return head;
-}
-  
 struct kthread_t *recv_kthread = NULL;
 struct kthread_t *send_kthread = NULL;
 
@@ -220,11 +192,11 @@ unsigned long in_aton(const char *str)
 /* Kernel Send Thread */
 static void send_client(void)
 {
-  int bufsize = 1024;
-  unsigned char msgbuf[bufsize];
+  //int bufsize = 1024;
+  //unsigned char msgbuf[bufsize];
   unsigned long flags;
   int err;
-  int len;
+  //int len;
   struct veth_priv *priv;
   struct veth_packet *pkt;
 
@@ -260,7 +232,8 @@ static void send_client(void)
     //schedule();
     //set_current_state(TASK_INTERRUPTIBLE);
     spin_lock_irqsave(&priv->lock, flags);
-    if(priv->tx_packetlen > 0) {
+    while(priv->tx_packetlen > 0) {
+      //if(priv->tx_packetlen > 0) {
       pkt = priv->tx_queue;
       if (pkt == NULL) goto out;
       priv->tx_queue = pkt->next;
@@ -270,17 +243,14 @@ static void send_client(void)
       pkt->next = priv->pool;
       priv->pool = pkt;
       if (priv->tx_packetlen == 0) priv->last = NULL;
-	  spin_unlock_irqrestore(&priv->lock, flags);
-	}
-	else {
-	  spin_unlock_irqrestore(&priv->lock, flags);
-	  set_current_state(TASK_INTERRUPTIBLE);
-	  schedule_timeout(1);
-	}
-	
+    }
+
+    spin_unlock_irqrestore(&priv->lock, flags);
+    set_current_state(TASK_INTERRUPTIBLE);
+    schedule_timeout(1);
     //set_current_state(TASK_RUNNING);
     if(signal_pending(current)) break;
-
+    
   }  
  out:
   PDEBUG("Error:Called out\n");
@@ -356,43 +326,6 @@ static void recv_server(void)
  release:
   sock_release(recv_kthread->sock);
   recv_kthread->sock = NULL;
-}
-
-static void client_init(struct udp_client *myclient)
-{
-  int err;
-  
-  PDEBUG("Called client_init\n");
-  /* create client socket */
-
-  if ( (err=sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &myclient->sock)) < 0) {
-	PDEBUG("Can not create client socket\n");
-	goto out;
-  }
-
-  memset(&myclient->addr, 0, sizeof(struct sockaddr));
-  myclient->addr.sin_family = AF_INET;
-  //myclient->addr.sin_addr.s_addr = htonl(in_aton("127.0.0.1"));
-  myclient->addr.sin_addr.s_addr = in_aton(dstip);
-  myclient->addr.sin_port = htons(dstport);
-  
-
-  if(  (err = myclient->sock->ops->connect(myclient->sock, (struct sockaddr *)&myclient->addr, sizeof(struct sockaddr),0)) < 0) {
-    PDEBUG("Failed to connect\n");
-    goto close_out;
-	}
-  myclient->connect = 1;
-  PDEBUG("Success connect\n");
-  return;
-  
- out:
-  myclient->connect = 0;
- close_out:
-  sock_release(myclient->sock);
-  myclient->connect = 0;
-  
-  PDEBUG("MY client connect:(%d)\n",myclient->connect);
-  return;
 }
 
 int ksocket_send(struct socket *sock, struct sockaddr_in *addr, unsigned char *buf, int len)
@@ -522,14 +455,15 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
     dev_kfree_skb(priv->skb);
   }
   */
-
+  dev_kfree_skb(priv->skb);
 }
 
 static int veth_tx(struct sk_buff *skb, struct net_device *dev)
 {
 
   int len;
-  char *data,shortpkt[ETH_ZLEN];
+  char *data;
+  char shortpkt[ETH_ZLEN];
   struct veth_priv *priv = netdev_priv(dev);
   unsigned char *p;
   struct iphdr ipheader;
@@ -569,8 +503,6 @@ static int veth_tx(struct sk_buff *skb, struct net_device *dev)
   if(p[12] == 8 && p[13] == 0) {
     PDEBUG("IP Payload\n");
     // IP Header
-
-
     p = skb_network_header(skb);
     memcpy(&ipheader, p, sizeof(ipheader));
     in.s_addr = ipheader.saddr;
