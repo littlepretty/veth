@@ -3,6 +3,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/kthread.h>
+#include <linux/sched.h>
 #include <linux/time.h>
 #include <linux/errno.h>
 
@@ -57,11 +58,11 @@ struct udp_client *myclient;
 struct kthread_t {
   struct task_struct *thread;
   struct socket *sock;
-  //struct socket *client;
   struct sockaddr_in addr;
-  //struct sockaddr_in cliaddr;
   int running;
 };
+
+signed long delay = 100;
 
 /* function prototype */
 int ksocket_recv(struct socket *sock, struct sockaddr_in *addr, unsigned char *buf, int len);
@@ -74,7 +75,7 @@ struct veth_packet {
   u8 data[ETH_DATA_LEN];
 };
 
-int pool_size = 8;
+int pool_size = 100;
 module_param(pool_size, int, 0);
 
 struct veth_priv {
@@ -94,11 +95,12 @@ struct veth_priv {
 void veth_setup_tx_pool()
 {
   struct veth_priv *priv;
-  int i;
   struct veth_packet *pkt;
+  int i;
+
+  PDEBUG("veth_setup_tx_pool\n");
 
   priv = netdev_priv(veth_dev);
-
   for(i = 0; i < pool_size; i++) {
     pkt = kmalloc(sizeof(struct veth_packet), GFP_KERNEL);
     if (pkt == NULL) {
@@ -116,15 +118,30 @@ struct veth_packet* veth_get_tx_buffer()
   struct veth_packet *pkt;
   struct veth_priv *priv = netdev_priv(veth_dev);
 
+  PDEBUG("veth_get_tx_buffer\n");
   spin_lock_irqsave(&priv->lock, flags);
   pkt = priv->pool;
   priv->pool = pkt->next;
   if (priv->pool == NULL) {
     printk(KERN_INFO "pool empty\n");
     netif_stop_queue(veth_dev);
+    return NULL;
   }
+
   spin_unlock_irqrestore(&priv->lock, flags);
   return pkt;
+}
+
+void veth_release_buf(struct veth_packet *pkt)
+{
+  //unsigned long flags;
+  struct veth_priv *priv = netdev_priv(veth_dev);
+  PDEBUG("veth_release_buf\n");
+
+  //spin_lock_irqsave(&priv->lock, flags);
+  pkt->next = priv->pool;
+  priv->pool = pkt;
+  //spin_unlock_irqrestore(&priv->lock, flags);
 }
 
 void veth_enqueue_buf(struct veth_packet *pkt)
@@ -134,11 +151,19 @@ void veth_enqueue_buf(struct veth_packet *pkt)
 
   struct veth_priv *priv = netdev_priv(veth_dev);
   
+  PDEBUG("veth_enqueue_buf\n");
   spin_lock_irqsave(&priv->lock, flags);
   last = priv->last;
-  last->next = pkt;
+  if (last == NULL) {
+    priv->tx_queue = pkt;
+  }
+  else
+    last->next = pkt;
+
+  priv->last = pkt;
   priv->tx_packetlen++;
   pkt->next = NULL;
+  PDEBUG("Have to send tx buffer len:(%d)\n",priv->tx_packetlen);
   spin_unlock_irqrestore(&priv->lock, flags);
 }
 
@@ -149,18 +174,20 @@ struct veth_packet* veth_dequeue_buf()
   struct veth_packet *next;
   struct veth_priv *priv = netdev_priv(veth_dev);
 
-  spin_lock_irqsave(&priv->lock, flags);
+  //spin_lock_irqsave(&priv->lock, flags);
+  PDEBUG("veth_dequeue_buf\n");
 
   head = priv->tx_queue;
-  next = head->next;
-  priv->tx_queue = next;
+  if (head == NULL)
+    PDEBUG("Head is NULL\n");
+  priv->tx_queue = head->next;
   priv->tx_packetlen--;
 
-  spin_unlock_irqrestore(&priv->lock, flags);
+  //spin_unlock_irqrestore(&priv->lock, flags);
   return head;
 }
   
-struct kthread_t *kthread = NULL;
+struct kthread_t *recv_kthread = NULL;
 struct kthread_t *send_kthread = NULL;
 
 static char buf[4*sizeof "123"];
@@ -242,20 +269,29 @@ static void send_client(void)
   
   /* main loop for client send */
   while(!kthread_should_stop()) {
+    PDEBUG("send client work\n");
     spin_lock_irqsave(&priv->lock, flags);
-    if (priv->tx_packetlen > 0) {
+    while(priv->tx_packetlen > 0) {
+      PDEBUG("In send_client:tx_packetlen(%d)\n",priv->tx_packetlen);
       pkt = veth_dequeue_buf();
       ksocket_send(send_kthread->sock, &send_kthread->addr, pkt->data, pkt->datalen);
+      PDEBUG("push to used pkt\n");
+      pkt->next = priv->pool;
+      priv->pool = pkt;
     }
-    spin_unlock_irqrestore(&priv->lock, flags);
-    
-    if(signal_pending(current)) break;
-	
-  }
+  spin_unlock_irqrestore(&priv->lock, flags);
   
+  set_current_state(TASK_INTERRUPTIBLE);
+  schedule_timeout(30*HZ);
+  //set_current_state(TASK_RUNNING);
+  if(signal_pending(current)) break;
+  
+  }  
  out:
+  PDEBUG("Error:Called out\n");
   return;
  close_out:
+  PDEBUG("Error:Called close_out\n");
   sock_release(send_kthread->sock);
 
   return;
@@ -272,9 +308,9 @@ static void recv_server(void)
   struct veth_priv *priv;
 
 
-  PDEBUG("\n#### Kernel thread initialize #####\n");
+  PDEBUG("#### Recv Kernel thread initialize #####\n");
   lock_kernel();
-  kthread->running = 1;
+  recv_kthread->running = 1;
   current->flags |= PF_NOFREEZE;
   daemonize(MODULE_NAME);
   allow_signal(SIGKILL);
@@ -284,19 +320,21 @@ static void recv_server(void)
 
   /* create socket */
   /* initial udp kernel socket server */
-  err = sock_create_kern(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &kthread->sock);
+  err = sock_create_kern(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &recv_kthread->sock);
   if (err < 0) {
     PDEBUG("sock_create() err %d\n", err);
     return;
   }
 
-  memset(&kthread->addr, 0, sizeof(kthread->addr));
-  kthread->addr.sin_family      = AF_INET;
-  kthread->addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  kthread->addr.sin_port        = htons(srcport);
+  memset(&recv_kthread->addr, 0, sizeof(recv_kthread->addr));
+  recv_kthread->addr.sin_family      = AF_INET;
+  recv_kthread->addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  recv_kthread->addr.sin_port        = htons(srcport);
 
   // bind
-  err = kthread->sock->ops->bind(kthread->sock, (struct sockaddr *)&kthread->addr, sizeof(struct sockaddr_in));
+  err = recv_kthread->sock->ops->bind(recv_kthread->sock, 
+				      (struct sockaddr *)&recv_kthread->addr, 
+				      sizeof(struct sockaddr_in));
   if (err < 0) {
     PDEBUG("sock_bind() err %d\n", err);
     goto release;
@@ -307,7 +345,8 @@ static void recv_server(void)
     // receive data from remote device, and interrupt RECV
     memset(&msgbuf, 0, bufsize);
     // read data size (4 bytes)
-    len = ksocket_recv(kthread->sock, &kthread->addr, msgbuf, MAX_PAYLOAD);
+    len = ksocket_recv(recv_kthread->sock, &recv_kthread->addr, 
+		       msgbuf, MAX_PAYLOAD);
     if (len < 0 || len > MAX_PAYLOAD) {
       PDEBUG("RECV MSG size(%d)\n", len);
       continue;
@@ -320,8 +359,8 @@ static void recv_server(void)
 
 
  release:
-  sock_release(kthread->sock);
-  kthread->sock = NULL;
+  sock_release(recv_kthread->sock);
+  recv_kthread->sock = NULL;
 }
 
 static void client_init(struct udp_client *myclient)
@@ -457,11 +496,17 @@ static void veth_hw_tx(char *buf, int len, struct net_device *dev)
 
   // get veth_packet
   pkt = veth_get_tx_buffer();
+  if (pkt == NULL) {
+    PDEBUG("No tx buffer\n");
+    return;
+  }
+
   memcpy(pkt->data, buf, len);
   pkt->datalen = len;
 
   // push into buffer
   veth_enqueue_buf(pkt);
+
   /*
   if (myclient->connect != 1) {
     // reconnect
@@ -615,9 +660,12 @@ void veth_init(struct net_device *dev)
   dev->get_stats       = veth_stats; 
   priv = netdev_priv(dev);
   memset(priv, 0, sizeof(struct veth_priv));
+  priv->tx_queue = NULL;
+  priv->last = NULL;
+  priv->tx_packetlen = 0;
   spin_lock_init(&priv->lock);   /* enable receive interrupt */
   
-  veth_setup_tx_pool();
+
   //myclient = kmalloc(sizeof(struct udp_client),GFP_KERNEL);
   //client_init(myclient);
   //myclient->sock = NULL;
@@ -629,14 +677,14 @@ static void veth_cleanup(void)
 {
   PDEBUG("veth cleanup\n");
 
-  sock_release(kthread->sock);
+  sock_release(recv_kthread->sock);
   sock_release(send_kthread->sock);
   
   //sock_release(myclient->sock);
   
   //sock_release(client);
   //kthread_stop((struct task_struct*)kthread);
-  kfree(kthread);
+  kfree(recv_kthread);
   kfree(send_kthread);
   //kfree(myclient);
   
@@ -663,20 +711,25 @@ static int __init veth_init_module(void)
   else
     ret = 0;
 
+  veth_setup_tx_pool();
+
   /* kthread */
   // Server
-  kthread = kmalloc(sizeof(struct kthread_t), GFP_KERNEL);
-  memset(kthread, 0, sizeof(struct kthread_t));
-  kthread->thread = NULL;
+  PDEBUG("recv_kthread create\n");
+  recv_kthread = kmalloc(sizeof(struct kthread_t), GFP_KERNEL);
+  memset(recv_kthread, 0, sizeof(struct kthread_t));
+  recv_kthread->thread = NULL;
   // Client
+
+  PDEBUG("send_kthread create\n");
   send_kthread = kmalloc(sizeof(struct kthread_t), GFP_KERNEL);
   memset(send_kthread, 0, sizeof(struct kthread_t));
   send_kthread->thread = NULL;
 
   /* start kernel thread */
   PDEBUG("thread 1\n");
-  kthread->thread = kthread_run((void*)recv_server, NULL, "recv_server");
-  if(IS_ERR(kthread->thread))
+  recv_kthread->thread = kthread_run((void*)recv_server, NULL, "recv_server");
+  if(IS_ERR(recv_kthread->thread))
     goto out;
 
   PDEBUG("thread 2\n");
