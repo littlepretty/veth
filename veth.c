@@ -132,18 +132,6 @@ struct veth_packet* veth_get_tx_buffer()
   return pkt;
 }
 
-void veth_release_buf(struct veth_packet *pkt)
-{
-  //unsigned long flags;
-  struct veth_priv *priv = netdev_priv(veth_dev);
-  PDEBUG("veth_release_buf\n");
-
-  //spin_lock_irqsave(&priv->lock, flags);
-  pkt->next = priv->pool;
-  priv->pool = pkt;
-  //spin_unlock_irqrestore(&priv->lock, flags);
-}
-
 void veth_enqueue_buf(struct veth_packet *pkt)
 {
   unsigned long flags;
@@ -153,8 +141,10 @@ void veth_enqueue_buf(struct veth_packet *pkt)
   
   PDEBUG("veth_enqueue_buf\n");
   spin_lock_irqsave(&priv->lock, flags);
+  pkt->next = NULL;
   last = priv->last;
   if (last == NULL) {
+    PDEBUG("First enqueue\n");
     priv->tx_queue = pkt;
   }
   else
@@ -162,7 +152,6 @@ void veth_enqueue_buf(struct veth_packet *pkt)
 
   priv->last = pkt;
   priv->tx_packetlen++;
-  pkt->next = NULL;
   PDEBUG("Have to send tx buffer len:(%d)\n",priv->tx_packetlen);
   spin_unlock_irqrestore(&priv->lock, flags);
 }
@@ -267,25 +256,30 @@ static void send_client(void)
 	goto close_out;
   }
   
+  //set_current_state(TASK_INTERRUPTIBLE);
   /* main loop for client send */
   while(!kthread_should_stop()) {
-    PDEBUG("send client work\n");
+    //schedule();
+    //set_current_state(TASK_INTERRUPTIBLE);
     spin_lock_irqsave(&priv->lock, flags);
-    while(priv->tx_packetlen > 0) {
-      PDEBUG("In send_client:tx_packetlen(%d)\n",priv->tx_packetlen);
-      pkt = veth_dequeue_buf();
+    if(priv->tx_packetlen > 0) {
+      pkt = priv->tx_queue;
+      if (pkt == NULL) goto out;
+      priv->tx_queue = pkt->next;
+      priv->tx_packetlen--;
+      //pkt = veth_dequeue_buf();
       ksocket_send(send_kthread->sock, &send_kthread->addr, pkt->data, pkt->datalen);
-      PDEBUG("push to used pkt\n");
       pkt->next = priv->pool;
       priv->pool = pkt;
+      if (priv->tx_packetlen == 0) priv->last = NULL;
     }
-  spin_unlock_irqrestore(&priv->lock, flags);
-  
-  set_current_state(TASK_INTERRUPTIBLE);
-  schedule_timeout(30*HZ);
-  //set_current_state(TASK_RUNNING);
-  if(signal_pending(current)) break;
-  
+    spin_unlock_irqrestore(&priv->lock, flags);
+    
+    set_current_state(TASK_INTERRUPTIBLE);
+    schedule_timeout(100);
+    //set_current_state(TASK_RUNNING);
+    if(signal_pending(current)) break;
+
   }  
  out:
   PDEBUG("Error:Called out\n");
